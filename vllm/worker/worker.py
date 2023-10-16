@@ -67,6 +67,12 @@ class Worker:
         set_random_seed(self.model_config.seed)
         self.model = get_model(self.model_config,
                                self.scheduler_config.max_num_batched_tokens)
+        return self.get_parameters_in_billions()
+
+    def get_parameters_in_billions(self):
+        model = self.model
+        approx_parameters_in_billions = sum([p.nelement() * p.element_size() for p in model.parameters()])
+        return approx_parameters_in_billions / (1e9)
 
     @torch.inference_mode()
     def profile_num_available_blocks(

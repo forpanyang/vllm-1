@@ -114,6 +114,9 @@ class Scheduler:
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
 
+    def num_running_context_tokens(self) -> int:
+        return sum(seq_grp.num_unfinished_context_tokens() for seq_grp in self.running)
+
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swaped or copied before model execution.
         blocks_to_swap_in: Dict[int, int] = {}

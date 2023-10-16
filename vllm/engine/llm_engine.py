@@ -29,6 +29,20 @@ logger = init_logger(__name__)
 
 _LOGGING_INTERVAL_SEC = 5
 
+def kv_cache_size(num_tokens, hf_config):
+    return 2 * num_tokens * hf_config.num_key_value_heads * hf_config.hidden_size / hf_config.num_attention_heads
+
+def bandwidth_per_step(batch_size, seqlen, num_tokens, hf_config):
+    approx_kv_cache_size = kv_cache_size(num_tokens, hf_config) / (1e9)
+    # Estimated or profiled? Estimated currently
+    # [b, s, h]x3 // Q, K, V
+    # [b, s, h]x2 // Qemb, Kemb
+    # [b, s, h] // att, _ = FMHA(Qemb, Kemb, V)
+    # [b, s, h] // output
+    # [b, s, h_in]x4 // Up MLP, Gate MLP, Gelu, Up * Gelu
+    # [b, s, h] // Down MLP
+    approx_activation_size = batch_size * seqlen * hf_config.num_hidden_layers * (8 * hf_config.hidden_size + 4 * hf_config.intermediate_size) / (1e9)
+    return approx_activation_size * 2 + approx_kv_cache_size * 2
 
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
@@ -121,6 +135,9 @@ class LLMEngine:
         self.num_prompt_tokens: List[Tuple[float, int]] = []
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
+        self.flops: List[Tuple[float, int]] = []
+        self.bandwidth : List[Tuple[float, float]] = []
+        self.num_context_tokens: List[Tuple[float, int]] = []
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -139,7 +156,7 @@ class LLMEngine:
             distributed_init_method,
         )
         self.workers.append(worker)
-        self._run_workers(
+        self.parameters_in_billions = self._run_workers(
             "init_model",
             get_all_outputs=True,
         )
@@ -178,7 +195,7 @@ class LLMEngine:
                               None,
                               None,
                           ))
-        self._run_workers(
+        self.parameters_in_billions = self._run_workers(
             "init_model",
             get_all_outputs=True,
         )
@@ -533,10 +550,32 @@ class LLMEngine:
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
 
+        def flops_per_step(batch_size, seq_len, hf_config):
+            # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+            # https://arxiv.org/pdf/2104.04473.pdf).
+            return 24 * batch_size * seq_len * hf_config.num_hidden_layers * (hf_config.hidden_size**2) * \
+                   (1. + (seq_len / (6. * hf_config.hidden_size)) + \
+                    hf_config.vocab_size / (16. * hf_config.num_hidden_layers * hf_config.hidden_size)
+                   )
+
         if self.log_stats:
             # Log the system stats.
+            hf_config = self.model_config.hf_config
+            seq_len = 1
+            num_context_tokens = self.num_running_context_tokens
+            if scheduler_outputs.prompt_run:
+                batch = len(scheduled_seq_groups)
+                flops = flops_per_step(batch, max_prompt_len, hf_config)
+                seq_len = max_prompt_len
+                num_context_tokens = 0
+            else:
+                batch = scheduler_outputs.num_batched_tokens
+
+            flops = flops_per_step(batch, seq_len, hf_config)
+            bandwidth = self.parameters_in_billions[0] + bandwidth_per_step(batch, seq_len, num_context_tokens, hf_config) / self.parallel_config.world_size
             self._log_system_stats(scheduler_outputs.prompt_run,
-                                   scheduler_outputs.num_batched_tokens)
+                                   scheduler_outputs.num_batched_tokens, flops, bandwidth)
+
         return request_outputs
 
     def step(self) -> List[RequestOutput]:
@@ -551,6 +590,12 @@ class LLMEngine:
         seq_group_metadata_list, scheduler_outputs, ignored = self._schedule()
         if scheduler_outputs.is_empty():
             return ignored
+        scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+
+        num_running_context_tokens = self.scheduler.num_running_context_tokens()
+        # for seq_group in scheduled_seq_groups:
+        #      num_running_context_tokens = num_running_context_tokens + seq_group.num_unfinished_context_tokens()
+        self.num_running_context_tokens = num_running_context_tokens 
 
         # Execute the model.
         output = self._run_workers(
@@ -567,6 +612,8 @@ class LLMEngine:
         self,
         prompt_run: bool,
         num_batched_tokens: int,
+        flops: int,
+        bandwidth: float,
     ) -> None:
         now = time.monotonic()
         # Log the number of batched input tokens.
@@ -574,6 +621,9 @@ class LLMEngine:
             self.num_prompt_tokens.append((now, num_batched_tokens))
         else:
             self.num_generation_tokens.append((now, num_batched_tokens))
+        self.num_context_tokens.append((now, self.num_running_context_tokens))
+        self.flops.append((now, flops))
+        self.bandwidth.append((now, bandwidth))
 
         elapsed_time = now - self.last_logging_time
         if elapsed_time < _LOGGING_INTERVAL_SEC:
@@ -585,7 +635,15 @@ class LLMEngine:
         self.num_generation_tokens = [(t, n)
                                       for t, n in self.num_generation_tokens
                                       if now - t < _LOGGING_INTERVAL_SEC]
-
+        self.num_context_tokens = [(t, n)
+                                      for t, n in self.num_context_tokens
+                                      if now - t < _LOGGING_INTERVAL_SEC]
+ 
+        self.flops = [(t, n) for t, n in self.flops
+                                  if now - t < _LOGGING_INTERVAL_SEC]
+        self.bandwidth = [(t, n) for t, n in self.bandwidth
+                                  if now - t < _LOGGING_INTERVAL_SEC]
+ 
         if len(self.num_prompt_tokens) > 1:
             total_num_tokens = sum(n for _, n in self.num_prompt_tokens[:-1])
             window = now - self.num_prompt_tokens[0][0]
@@ -597,9 +655,31 @@ class LLMEngine:
                                    for _, n in self.num_generation_tokens[:-1])
             window = now - self.num_generation_tokens[0][0]
             avg_generation_throughput = total_num_tokens / window
+            avg_generation_batch = sum(n for _, n in self.num_generation_tokens) / len(self.num_generation_tokens)
         else:
             avg_generation_throughput = 0.0
+            avg_generation_batch = 0.0
 
+        if len(self.num_context_tokens) > 1:
+            avg_context_tokens = sum(n for _, n in self.num_context_tokens) / len(self.num_context_tokens)
+        else:
+            avg_context_tokens = 0.0
+ 
+        if len(self.flops) > 1:
+            total_flops = sum(n for _, n in self.flops[:-1])
+            window = now - self.flops[0][0]
+            avg_tflops = total_flops / (window * (10**12) * 
+                                        self.parallel_config.world_size)
+        else:
+            avg_tflops = 0.0
+
+        if len(self.bandwidth) > 1:
+            total_bandwidth = sum(n for _, n in self.bandwidth[:-1])
+            window = now - self.bandwidth[0][0]
+            avg_bandwidth = total_bandwidth / window
+        else:
+            avg_bandwidth = 0.0
+ 
         total_num_gpu_blocks = self.cache_config.num_gpu_blocks
         num_free_gpu_blocks = (
             self.scheduler.block_manager.get_num_free_gpu_blocks())
@@ -619,6 +699,14 @@ class LLMEngine:
                     f"{avg_prompt_throughput:.1f} tokens/s, "
                     "Avg generation throughput: "
                     f"{avg_generation_throughput:.1f} tokens/s, "
+                    "Avg generation batch: "
+                    f"{avg_generation_batch:.1f}, "
+                    "Avg context tokens: "
+                    f"{avg_context_tokens:.1f} tokens, "
+                    "Avg Model tFlops: "
+                    f"{avg_tflops:.1f} tflops/s, "
+                    "Avg Model Bandwidth: "
+                    f"{avg_bandwidth:.1f} GB/s, "
                     f"Running: {len(self.scheduler.running)} reqs, "
                     f"Swapped: {len(self.scheduler.swapped)} reqs, "
                     f"Pending: {len(self.scheduler.waiting)} reqs, "

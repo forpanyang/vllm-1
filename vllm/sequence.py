@@ -278,6 +278,9 @@ class SequenceGroup:
     def num_unfinished_seqs(self) -> int:
         return len(self.get_unfinished_seqs())
 
+    def num_unfinished_context_tokens(self):
+        return sum(seq.get_len() for seq in self.get_unfinished_seqs())
+
     def num_finished_seqs(self) -> int:
         return len(self.get_finished_seqs())
 
