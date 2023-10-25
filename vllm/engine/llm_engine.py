@@ -138,6 +138,8 @@ class LLMEngine:
         self.flops: List[Tuple[float, int]] = []
         self.bandwidth : List[Tuple[float, float]] = []
         self.num_context_tokens: List[Tuple[float, int]] = []
+        self.all_flops = []
+        self.all_bandwidth = []
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -537,7 +539,11 @@ class LLMEngine:
             scheduler_outputs: SchedulerOutputs) -> List[RequestOutput]:
         # Update the scheduled sequence groups with the model outputs.
         scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+        max_prompt_len = 0
         for seq_group, samples in zip(scheduled_seq_groups, output):
+            if scheduler_outputs.prompt_run:
+                 assert 1 == len(seq_group.get_seqs())
+                 max_prompt_len = max(max_prompt_len, seq_group.get_seqs()[0].get_prompt_len())
             self._process_sequence_group_samples(seq_group, samples)
 
         # Free the finished sequence groups.
@@ -549,6 +555,7 @@ class LLMEngine:
                           scheduler_outputs.ignored_seq_groups):
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
+
 
         def flops_per_step(batch_size, seq_len, hf_config):
             # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
@@ -712,6 +719,14 @@ class LLMEngine:
                     f"Pending: {len(self.scheduler.waiting)} reqs, "
                     f"GPU KV cache usage: {gpu_cache_usage * 100:.1f}%, "
                     f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
+
+        if gpu_cache_usage > 0.60:
+            self.all_flops.append(avg_tflops)
+            self.all_bandwidth.append(avg_bandwidth)
+            mean_flops = sum(self.all_flops) / len(self.all_flops)
+            mean_bandwidth = sum(self.all_bandwidth) / len(self.all_bandwidth)
+            logger.info(f"Avg tflops: {mean_flops:.1f} tflops/s, Bandwidth: {mean_bandwidth:.1f} GB/s")
+
         self.last_logging_time = now
 
     def _decode_sequence(self, seq: Sequence,

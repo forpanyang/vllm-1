@@ -187,6 +187,9 @@ class _AsyncLLMEngine(LLMEngine):
         if scheduler_outputs.is_empty():
             return ignored
 
+        num_running_context_tokens = self.scheduler.num_running_context_tokens()
+        self.num_running_context_tokens = num_running_context_tokens 
+
         # Execute the model.
         output = await self._run_workers_async(
             "execute_model",
