@@ -24,6 +24,25 @@ BLOCK_SIZES = [8, 16, 32]
 USE_ALIBI = [False, True]
 SEEDS = [0]
 
+def quantize_kv_cache(fdata):
+    # fdata: [num_blocks, num_heads, head_dim, block_size]
+    qtype = torch.int8
+    device = fdata.device
+    shape = fdata.shape
+
+    fdata_cal = fdata
+    fmax = torch.amax(fdata_cal, dim=-2, keepdim=True)
+    fmin = torch.amin(fdata_cal, dim=-2, keepdim=True)
+    # Compute params
+    qmax = torch.tensor(torch.iinfo(qtype).max, dtype=fdata.dtype, device=fdata.device)
+    qmin = torch.tensor(torch.iinfo(qtype).min, dtype=fdata.dtype, device=fdata.device)
+    scale = (fmax - fmin) / (qmax - qmin)
+    zero = fmin - qmin * scale
+    # Quantize
+    res_data = (fdata - zero) / scale
+    qdata = torch.clamp(res_data, qmin, qmax).to(qtype)
+    return qdata.contiguous(), scale.transpose(-1, -2), zero.transpose(-1, -2)
+
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -76,6 +95,69 @@ def ref_single_query_cached_kv_attention(
 
             v = value_cache[block_number, :, :, block_offset]
             values.append(v)
+        keys = torch.stack(keys, dim=0)
+        values = torch.stack(values, dim=0)
+        if num_queries_per_kv > 1:
+            # Handle MQA and GQA
+            keys = torch.repeat_interleave(keys, num_queries_per_kv, dim=1)
+            values = torch.repeat_interleave(values, num_queries_per_kv, dim=1)
+
+        alibi_bias = None
+        if alibi_slopes is not None:
+            # Create the ALiBi bias used in the paged attention kernel.
+            position_ids = torch.arange(context_len, device="cuda").int()
+            alibi_bias = (position_ids - context_len + 1).float()
+            alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(
+                1, 1, -1)
+
+        out = ref_masked_attention(q, keys, values, scale, alibi_bias)
+        out = out.view(num_query_heads, head_size)
+        output[i].copy_(out, non_blocking=True)
+
+
+def ref_single_query_cached_kv_attention_quantized(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    num_queries_per_kv: int,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    quant_params: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+) -> None:
+    num_query_heads = query.shape[1]
+    num_kv_heads = value_cache.shape[1]
+    head_size = value_cache.shape[2]
+    block_size = value_cache.shape[3]
+    num_seqs = query.shape[0]
+
+    block_tables = block_tables.cpu().tolist()
+    context_lens = context_lens.cpu().tolist()
+    for i in range(num_seqs):
+        q = query[i].unsqueeze(0)
+        block_table = block_tables[i]
+        context_len = int(context_lens[i])
+
+        keys = []
+        values = []
+        for j in range(context_len):
+            block_number = int(block_table[j // block_size])
+            block_offset = j % block_size
+
+            q_params = quant_params[block_number, :, block_offset]
+            q_params = q_params.reshape(num_kv_heads, 4, 1)
+
+            k = key_cache[block_number, :, :, block_offset, :]
+            k = k.reshape(num_kv_heads, head_size)
+            k = k * q_params[:, 0] + q_params[:, 1]
+            keys.append(k)
+
+            v = value_cache[block_number, :, :, block_offset]
+            v = v * q_params[:, 2] + q_params[:, 3]
+            values.append(v)
+
         keys = torch.stack(keys, dim=0)
         values = torch.stack(values, dim=0)
         if num_queries_per_kv > 1:
@@ -227,6 +309,115 @@ def ref_multi_query_kv_attention(
         ref_outputs.append(ref_output)
     ref_output = torch.cat(ref_outputs, dim=0)
     return ref_output
+
+@pytest.mark.parametrize("num_seqs", NUM_GEN_SEQS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("use_alibi", USE_ALIBI)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_single_query_cached_kv_attention_quantized(
+    kv_cache_factory,
+    num_seqs: int,
+    num_heads: Tuple[int, int],
+    head_size: int,
+    use_alibi: bool,
+    block_size: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> None:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    scale = float(1.0 / (head_size**0.5))
+    num_query_heads, num_kv_heads = num_heads
+    query = torch.empty(num_seqs,
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype,
+                        device="cuda")
+    query.uniform_(-scale, scale)
+
+    assert num_query_heads % num_kv_heads == 0
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_mapping = torch.repeat_interleave(
+        torch.arange(num_kv_heads, dtype=torch.int32, device="cuda"),
+        num_queries_per_kv)
+    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes = torch.randn(num_query_heads,
+                                   dtype=torch.float,
+                                   device="cuda")
+
+    context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
+    context_lens[-1] = MAX_SEQ_LEN
+    max_context_len = max(context_lens)
+    context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
+
+    # Create the block tables.
+    max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
+    block_tables = []
+    for _ in range(num_seqs):
+        block_table = [
+            random.randint(0, NUM_BLOCKS - 1)
+            for _ in range(max_num_blocks_per_seq)
+        ]
+        block_tables.append(block_table)
+    block_tables = torch.tensor(block_tables, dtype=torch.int, device="cuda")
+
+    # Create the KV caches.
+    key_caches, value_caches = kv_cache_factory(NUM_BLOCKS, block_size, 1,
+                                                num_kv_heads, head_size, dtype,
+                                                seed)
+    key_cache, value_cache = key_caches[0], value_caches[0]
+    key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size)
+    key_cache = key_cache.transpose(-1, -2).contiguous().view(key_cache_shape)
+    x = 16 // torch.tensor([], dtype=torch.int8).element_size()
+    q_key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size//x, x, block_size)
+    q_key_cache, k_scale, k_zero = quantize_kv_cache(key_cache)
+    q_key_cache = q_key_cache.view(q_key_cache_shape).transpose(-1, -2).contiguous()
+    q_value_cache, v_scale, v_zero = quantize_kv_cache(value_cache)
+    quant_params = torch.cat([k_scale, k_zero, v_scale, v_zero], dim=-1)
+
+    # Call the paged attention kernel.
+    output = torch.empty_like(query)
+    attention_ops.single_query_cached_kv_attention_quantized(
+        output,
+        query,
+        q_key_cache,
+        q_value_cache,
+        quant_params,
+        head_mapping,
+        scale,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        alibi_slopes,
+    )
+
+    # Run the reference implementation.
+    ref_output = torch.empty_like(query)
+    ref_single_query_cached_kv_attention_quantized(
+        ref_output,
+        query,
+        num_queries_per_kv,
+        q_key_cache,
+        q_value_cache,
+        quant_params,
+        block_tables,
+        context_lens,
+        scale,
+        alibi_slopes,
+    )
+
+    # NOTE(woosuk): Due to the kernel-level differences in the two
+    # implementations, there is a small numerical difference in the two
+    # outputs. Thus, we use a relaxed tolerance for the test.
+    assert torch.allclose(output, ref_output, atol=1e-3, rtol=1e-5)
 
 
 # TODO(woosuk): Add tests for USE_ALIBI=True.
