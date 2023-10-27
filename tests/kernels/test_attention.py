@@ -24,25 +24,6 @@ BLOCK_SIZES = [8, 16, 32]
 USE_ALIBI = [False, True]
 SEEDS = [0]
 
-def quantize_kv_cache(fdata):
-    # fdata: [num_blocks, num_heads, head_dim, block_size]
-    qtype = torch.int8
-    device = fdata.device
-    shape = fdata.shape
-
-    fdata_cal = fdata
-    fmax = torch.amax(fdata_cal, dim=-2, keepdim=True)
-    fmin = torch.amin(fdata_cal, dim=-2, keepdim=True)
-    # Compute params
-    qmax = torch.tensor(torch.iinfo(qtype).max, dtype=fdata.dtype, device=fdata.device)
-    qmin = torch.tensor(torch.iinfo(qtype).min, dtype=fdata.dtype, device=fdata.device)
-    scale = (fmax - fmin) / (qmax - qmin)
-    zero = fmin - qmin * scale
-    # Quantize
-    res_data = (fdata - zero) / scale
-    qdata = torch.clamp(res_data, qmin, qmax).to(qtype)
-    return qdata.contiguous(), scale.transpose(-1, -2), zero.transpose(-1, -2)
-
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -310,6 +291,7 @@ def ref_multi_query_kv_attention(
     ref_output = torch.cat(ref_outputs, dim=0)
     return ref_output
 
+
 @pytest.mark.parametrize("num_seqs", NUM_GEN_SEQS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -319,6 +301,7 @@ def ref_multi_query_kv_attention(
 @pytest.mark.parametrize("seed", SEEDS)
 @torch.inference_mode()
 def test_single_query_cached_kv_attention_quantized(
+    quantize_kv_cache,
     kv_cache_factory,
     num_seqs: int,
     num_heads: Tuple[int, int],
@@ -373,15 +356,8 @@ def test_single_query_cached_kv_attention_quantized(
                                                 num_kv_heads, head_size, dtype,
                                                 seed)
     key_cache, value_cache = key_caches[0], value_caches[0]
-    key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size)
-    key_cache = key_cache.transpose(-1, -2).contiguous().view(key_cache_shape)
-    x = 16 // torch.tensor([], dtype=torch.int8).element_size()
-    q_key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size//x, x, block_size)
-    q_key_cache, k_scale, k_zero = quantize_kv_cache(key_cache)
-    q_key_cache = q_key_cache.view(q_key_cache_shape).transpose(-1, -2).contiguous()
-    q_value_cache, v_scale, v_zero = quantize_kv_cache(value_cache)
-    quant_params = torch.cat([k_scale, k_zero, v_scale, v_zero], dim=-1)
-
+    q_key_cache, q_value_cache, quant_params = quantize_kv_cache(
+            key_cache, value_cache)
     # Call the paged attention kernel.
     output = torch.empty_like(query)
     attention_ops.single_query_cached_kv_attention_quantized(

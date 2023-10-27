@@ -129,7 +129,7 @@ ext_modules = []
 # Cache operations.
 cache_extension = CUDAExtension(
     name="vllm.cache_ops",
-    sources=["csrc/cache.cpp", "csrc/cache_kernels.cu"],
+    sources=["csrc/cache.cpp", "csrc/cache_kernels.cu", "csrc/cache_kernels_quantized.cu"],
     extra_compile_args={
         "cxx": CXX_FLAGS,
         "nvcc": NVCC_FLAGS,

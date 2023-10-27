@@ -13,12 +13,25 @@ void copy_blocks(
   std::vector<torch::Tensor>& value_caches,
   const std::map<int64_t, std::vector<int64_t>>& block_mapping);
 
+void copy_blocks_quantized(
+    std::vector<torch::Tensor> &key_caches,
+    std::vector<torch::Tensor> &value_caches,
+    std::vector<torch::Tensor> &quant_params,
+    const std::map<int64_t, std::vector<int64_t>> &block_mapping);
+
 void reshape_and_cache(
   torch::Tensor& key,
   torch::Tensor& value,
   torch::Tensor& key_cache,
   torch::Tensor& value_cache,
   torch::Tensor& slot_mapping);
+
+void reshape_and_cache_quantized(torch::Tensor &key, torch::Tensor &value,
+                                 torch::Tensor &q_params,
+                                 torch::Tensor &key_cache,
+                                 torch::Tensor &value_cache,
+                                 torch::Tensor &q_params_cache,
+                                 torch::Tensor &slot_mapping);
 
 void gather_cached_kv(
   torch::Tensor& key,
@@ -36,10 +49,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "copy_blocks",
     &copy_blocks,
     "Copy the cache blocks from src to dst");
+  m.def("copy_blocks_quantized", &copy_blocks_quantized,
+        "Copy the quantized cache blocks from src to dst");
   m.def(
     "reshape_and_cache",
     &reshape_and_cache,
     "Reshape the key and value tensors and cache them");
+  m.def("reshape_and_cache_quantized", &reshape_and_cache_quantized,
+        "Reshape the quantized key and value tensors and cache them");
   m.def(
     "gather_cached_kv",
     &gather_cached_kv,
