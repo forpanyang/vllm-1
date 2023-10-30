@@ -81,7 +81,6 @@ def do_quantize_kv_cache(key_cache, value_cache, is_cache=True):
     head_size = head_size_div_x * x
     key_cache_shape = (num_blocks, num_kv_heads, head_size, block_size)
     key_cache = key_cache.transpose(-1, -2).contiguous().view(key_cache_shape)
-    x = 16 // torch.tensor([], dtype=torch.int8).element_size()
     q_key_cache_shape = (num_blocks, num_kv_heads, head_size//x, x, block_size)
     q_key_cache, k_scale, k_zero = _quantize_kv_cache(key_cache)
     q_key_cache = q_key_cache.view(

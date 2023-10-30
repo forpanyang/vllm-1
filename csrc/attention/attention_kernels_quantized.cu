@@ -149,7 +149,7 @@ __global__ void single_query_cached_kv_attention_quantized_kernel(
 
   // x == THREAD_GROUP_SIZE * VEC_SIZE
   // Each thread group fetches x elements from the key at a time.
-  constexpr int x = 16 / sizeof(cache_t);
+  constexpr int x = 16 / sizeof(scalar_t);
   float qk_max = -FLT_MAX;
 
   const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
@@ -177,7 +177,9 @@ __global__ void single_query_cached_kv_attention_quantized_kernel(
 
       const scalar_t *k_quant_params =
           quant_params +
-          (physical_block_number * num_kv_heads + kv_head_idx) * 4 * BLOCK_SIZE;
+          (physical_block_number * num_kv_heads + kv_head_idx) * 4 *
+              BLOCK_SIZE +
+          physical_block_offset * 4;
       const float k_scale = __cast_to_float(k_quant_params[0]);
       const float k_zp = __cast_to_float(k_quant_params[1]);
 
@@ -286,12 +288,23 @@ __global__ void single_query_cached_kv_attention_quantized_kernel(
     const cache_t *v_ptr = v_cache + physical_block_number * kv_block_stride +
                            kv_head_idx * kv_head_stride;
 
-    const scalar_t *v_quant_params =
+    // quant_params[physical_block_number, kv_head_idx, physical_block_offset,
+    // 2:]
+    const scalar_t *v_quant_params_base =
         quant_params +
         (physical_block_number * num_kv_heads + kv_head_idx) * 4 * BLOCK_SIZE +
-        2;
-    const float v_scale = __cast_to_float(v_quant_params[0]);
-    const float v_zp = __cast_to_float(v_quant_params[1]);
+        physical_block_offset * 4 + 2;
+
+    QuantParamVec<V_VEC_SIZE> v_scales;
+    QuantParamVec<V_VEC_SIZE> v_zeros;
+
+    for (int i = 0; i < V_VEC_SIZE; ++i) {
+      const scalar_t *v_quant_params = v_quant_params_base + i * 4;
+      const float v_scale = __cast_to_float(v_quant_params[0]);
+      const float v_zp = __cast_to_float(v_quant_params[1]);
+      v_scales.params[i] = v_scale;
+      v_zeros.params[i] = v_zp;
+    }
 
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
@@ -300,7 +313,8 @@ __global__ void single_query_cached_kv_attention_quantized_kernel(
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec_quant v_vec_quant =
             *reinterpret_cast<const V_vec_quant *>(v_ptr + offset);
-        V_vec_dequant v_vec_dequant = dequant(v_vec_quant, v_scale, v_zp);
+        V_vec_dequant v_vec_dequant =
+            dequant(v_vec_quant, v_scales.data, v_zeros.data);
         V_vec v_vec = vec_conversion<V_vec, V_vec_dequant>(v_vec_dequant);
         if (block_idx == num_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the

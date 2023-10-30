@@ -40,6 +40,13 @@ void gather_cached_kv(
   torch::Tensor& value_cache,
   torch::Tensor& slot_mapping);
 
+void gather_cached_kv_quantized(torch::Tensor &key, torch::Tensor &value,
+                                torch::Tensor &q_param,
+                                torch::Tensor &key_cache,
+                                torch::Tensor &value_cache,
+                                torch::Tensor &q_param_cache,
+                                torch::Tensor &slot_mapping);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
     "swap_blocks",
@@ -61,4 +68,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "gather_cached_kv",
     &gather_cached_kv,
     "Gather key and value from the cache into contiguous QKV tensors");
+  m.def("gather_cached_kv_quantized", &gather_cached_kv_quantized,
+        "Gather key and value from the quantized cache into contiguous QKV "
+        "tensors");
 }

@@ -65,6 +65,7 @@ class ModelConfig:
         tokenizer_revision: Optional[str] = None,
         max_model_len: Optional[int] = None,
         quantization: Optional[str] = None,
+        kv_cache_quant: Optional[bool] = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -81,6 +82,7 @@ class ModelConfig:
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
         self.max_model_len = _get_and_verify_max_len(self.hf_config,
                                                      max_model_len)
+        self.kv_cache_quant = kv_cache_quant
         self._verify_load_format()
         self._verify_tokenizer_mode()
         self._verify_quantization()

@@ -93,6 +93,7 @@ class LlamaAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -142,7 +143,8 @@ class LlamaAttention(nn.Module):
             max_position=self.max_position_embeddings,
             rotary_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,
-            rope_scaling=rope_scaling)
+            rope_scaling=rope_scaling,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -154,9 +156,14 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
-                                input_metadata, cache_event)
+        if len(kv_cache) == 2:
+            k_cache, v_cache = kv_cache
+            attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
+                                    input_metadata, cache_event)
+        else:
+            k_cache, v_cache, q_param_cache = kv_cache
+            attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
+                                    input_metadata, cache_event, q_param_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -167,6 +174,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_idx: int = 0
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -183,6 +191,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            layer_idx=layer_idx
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -241,8 +250,8 @@ class LlamaModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, quant_config, k)
+            for k in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

@@ -9,6 +9,33 @@
 #include "dtype_float32.cuh"
 using namespace vllm;
 
+template <int VEC_SIZE>
+union QuantParamVec {};
+
+template <>
+union QuantParamVec<1> {
+    float params[1];
+    float data;
+};
+
+template <>
+union QuantParamVec<2> {
+    float params[2];
+    float2 data;
+};
+
+template <>
+union QuantParamVec<4> {
+    float params[4];
+    Float4_ data;
+};
+
+template <>
+union QuantParamVec<8> {
+    float params[8];
+    Float8_ data;
+};
+
 // this function is for function matching, delete it after writing customized dispatch functions
 inline __device__ int8_t quant(double a, const float scale, const float zp)
 {
@@ -125,6 +152,22 @@ inline __device__ float2 dequant(int16_t a, const float scale, const float zp)
     return b;
 }
 
+
+// int8x2 to float32x2
+inline __device__ float2 dequant(int16_t a, const float2 scale, const float2 zp)
+{
+    union {
+        int8_t  int8[2];
+        int16_t int16;
+    };
+    int16 = a;
+
+    float2 b;
+    b.x = int8[0] * scale.x + zp.x;
+    b.y = int8[1] * scale.y + zp.y;
+    return b;
+}
+
 // int8x4 to float32x4
 inline __device__ Float4_ dequant(int32_t a, const float scale, const float zp)
 {
@@ -142,6 +185,23 @@ inline __device__ Float4_ dequant(int32_t a, const float scale, const float zp)
     return b;
 }
 
+// int8x4 to float32x4
+inline __device__ Float4_ dequant(int32_t a, const Float4_ scale, const Float4_ zp)
+{
+    union {
+        int8_t  int8[4];
+        int32_t int32;
+    };
+    int32 = a;
+
+    Float4_ b;
+    b.x.x = (int8[0] * scale.x.x) + zp.x.x;
+    b.x.y = (int8[1] * scale.x.y) + zp.x.y;
+    b.y.x = (int8[2] * scale.y.x) + zp.y.x;
+    b.y.y = (int8[3] * scale.y.y) + zp.y.y;
+    return b;
+}
+
 inline __device__ Float8_ dequant(int64_t a, const float scale, const float zp)
 {
     union {
@@ -155,6 +215,22 @@ inline __device__ Float8_ dequant(int64_t a, const float scale, const float zp)
     b.y = dequant(int16[1], scale, zp);
     b.z = dequant(int16[2], scale, zp);
     b.w = dequant(int16[3], scale, zp);
+    return b;
+}
+
+inline __device__ Float8_ dequant(int64_t a, const Float8_ scale, const Float8_ zp)
+{
+    union {
+        int16_t int16[4];
+        int64_t int64;
+    };
+    int64 = a;
+
+    Float8_ b;
+    b.x = dequant(int16[0], scale.x, zp.x);
+    b.y = dequant(int16[1], scale.y, zp.y);
+    b.z = dequant(int16[2], scale.z, zp.z);
+    b.w = dequant(int16[3], scale.w, zp.w);
     return b;
 }
 

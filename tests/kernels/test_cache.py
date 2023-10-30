@@ -309,3 +309,77 @@ def test_reshape_and_cache_quantized(
     assert torch.allclose(key_cache, cloned_key_cache)
     assert torch.allclose(value_cache, cloned_value_cache)
     assert torch.allclose(param_cache, cloned_param_cache)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_gather_cached_kv_quantized(
+    quantize_kv_cache,
+    kv_cache_factory,
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> None:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # Create a random slot mapping.
+    num_slots = block_size * num_blocks
+    slot_mapping = random.sample(range(num_slots), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int, device="cuda")
+
+    qkv = torch.randn(num_tokens,
+                      3,
+                      num_heads,
+                      head_size,
+                      dtype=dtype,
+                      device="cuda")
+    _, key, value = qkv.unbind(dim=1)
+    # Create the KV caches.
+    key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
+                                                num_heads, head_size, dtype,
+                                                seed)
+    q_key_caches = []
+    q_value_caches = []
+    q_param_caches = []
+    for k_cache, v_cache in zip(key_caches, value_caches):
+        q_k_cache, q_v_cache, q_params = quantize_kv_cache(k_cache, v_cache)
+        q_key_caches.append(q_k_cache)
+        q_value_caches.append(q_v_cache)
+        q_param_caches.append(q_params)
+
+    key_cache, value_cache, param_cache = \
+        q_key_caches[0], q_value_caches[0], q_param_caches[0]
+    key, value, q_param = quantize_kv_cache(key, value, is_cache=False)
+
+    # Clone the KV caches.
+    cloned_key = key.clone()
+    cloned_value = value.clone()
+    cloned_param = q_param.clone()
+
+    # Call the reshape_and_cache kernel.
+    cache_ops.reshape_and_cache_quantized(
+            key, value, q_param, key_cache, value_cache, param_cache,
+            slot_mapping)
+    key.zero_()
+    value.zero_()
+    q_param.zero_()
+    # Call the reshape_and_cache kernel.
+    cache_ops.gather_cached_kv_quantized(
+            key, value, q_param, key_cache, value_cache, param_cache,
+            slot_mapping)
+
+    assert torch.allclose(key, cloned_key)
+    assert torch.allclose(value, cloned_value)
+    assert torch.allclose(q_param, cloned_param)

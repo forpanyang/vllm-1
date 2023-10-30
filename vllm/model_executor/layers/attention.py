@@ -17,6 +17,33 @@ from vllm.model_executor.layers.rotary_embedding import (
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 
 
+def _quantize_kv_cache(fdata):
+    qtype = torch.int8
+    # fdata: [seqs, num_heads, head_dim]
+    head_dim = -1
+
+    fmax = torch.amax(fdata, dim=head_dim, keepdim=True)
+    fmin = torch.amin(fdata, dim=head_dim, keepdim=True)
+    # Compute params
+    qmax = torch.tensor(torch.iinfo(qtype).max,
+                        dtype=fdata.dtype, device=fdata.device)
+    qmin = torch.tensor(torch.iinfo(qtype).min,
+                        dtype=fdata.dtype, device=fdata.device)
+    scale = (fmax - fmin) / (qmax - qmin)
+    zero = fmin - qmin * scale
+    # Quantize
+    res_data = (fdata - zero) / scale
+    qdata = torch.clamp(res_data, qmin, qmax).to(qtype)
+    return qdata.contiguous(), scale, zero
+
+
+def quantize_kv_cache(key, value):
+    q_key, k_scale, k_zero = _quantize_kv_cache(key)
+    q_value, v_scale, v_zero = _quantize_kv_cache(value)
+    quant_params = torch.cat([k_scale, k_zero, v_scale, v_zero], dim=-1)
+    return q_key, q_value, quant_params
+
+
 class PagedAttention(nn.Module):
     # pylint: disable=line-too-long
     """GPT-style multi-head PagedAttention.
@@ -59,13 +86,16 @@ class PagedAttention(nn.Module):
                  head_size: int,
                  scale: float,
                  num_kv_heads: Optional[int] = None,
-                 sliding_window: Optional[int] = None) -> None:
+                 sliding_window: Optional[int] = None,
+                 layer_idx: int = 0) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
+        self.layer_idx = layer_idx
+        self.step = 0
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -137,6 +167,7 @@ class PagedAttention(nn.Module):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         input_metadata: InputMetadata,
+        q_param_cache=None
     ) -> None:
         """PagedAttention for the generation tokens.
 
@@ -150,6 +181,21 @@ class PagedAttention(nn.Module):
             input_metadata: metadata for paged attention.
         """
         block_size = value_cache.shape[3]
+        if q_param_cache is not None:
+            return attention_ops.single_query_cached_kv_attention_quantized(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                q_param_cache,
+                self.head_mapping,
+                self.scale,
+                input_metadata.block_tables,
+                input_metadata.context_lens,
+                block_size,
+                input_metadata.max_context_len,
+                None,  # alibi_slopes
+            )
         attention_ops.single_query_cached_kv_attention(
             output,
             query,
@@ -173,6 +219,7 @@ class PagedAttention(nn.Module):
         value_cache: Optional[torch.Tensor],
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
+        q_param_cache=None
     ) -> torch.Tensor:
         """PagedAttention forward pass.
 
@@ -189,6 +236,8 @@ class PagedAttention(nn.Module):
                 block_size]
             input_metadata: metadata for paged attention.
             cache_event: event to wait for the cache operations to finish.
+            q_param: shape = [num_tokens, num_kv_heads * 4]
+            q_param_cache: shape = [num_blocks, num_kv_heads, block_size, 4]
 
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -235,13 +284,24 @@ class PagedAttention(nn.Module):
                 value_to_cache = value_to_cache[input_metadata.to_cache]
                 slot_mapping = slot_mapping[input_metadata.to_cache]
 
-            cache_ops.reshape_and_cache(
-                key_to_cache,
-                value_to_cache,
-                key_cache,
-                value_cache,
-                slot_mapping,
-            )
+            if q_param_cache is not None:
+                q_kv_params = quantize_kv_cache(key_to_cache, value_to_cache)
+                q_key, q_val, q_param = q_kv_params
+                cache_ops.reshape_and_cache_quantized(
+                    *q_kv_params,
+                    key_cache,
+                    value_cache,
+                    q_param_cache,
+                    slot_mapping,
+                )
+            else:
+                cache_ops.reshape_and_cache(
+                    key_to_cache,
+                    value_to_cache,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )
 
         if input_metadata.num_generation_tokens > 0:
             # Decoding run.
@@ -253,7 +313,7 @@ class PagedAttention(nn.Module):
             self.single_query_cached_kv_attention(
                 output[num_prompt_tokens:num_valid_tokens],
                 query[num_prompt_tokens:num_valid_tokens], key_cache,
-                value_cache, input_metadata)
+                value_cache, input_metadata, q_param_cache,)
 
         # Reshape the output tensor.
         # NOTE(woosuk): The output tensor may include paddings.
@@ -275,12 +335,14 @@ class PagedAttentionWithRoPE(PagedAttention):
         is_neox_style: bool = True,
         rope_scaling: Optional[Dict[str, Any]] = None,
         sliding_window: Optional[int] = None,
+        layer_idx: int = 0
     ) -> None:
         super().__init__(num_heads,
                          head_size,
                          scale,
                          num_kv_heads,
-                         sliding_window=sliding_window)
+                         sliding_window=sliding_window,
+                         layer_idx=layer_idx)
         if rope_scaling is None:
             self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
                                               max_position, base,
@@ -309,6 +371,7 @@ class PagedAttentionWithRoPE(PagedAttention):
         value_cache: torch.Tensor,
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
+        q_param_cache=None
     ) -> torch.Tensor:
         """ PagedAttention forward pass with rotary embedding.
 
@@ -339,6 +402,7 @@ class PagedAttentionWithRoPE(PagedAttention):
             value_cache,
             input_metadata,
             cache_event,
+            q_param_cache
         )
 
 

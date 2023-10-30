@@ -35,6 +35,7 @@ class CacheEngine:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
         self.dtype = model_config.dtype
+        self.kv_dtype = torch.int8 if model_config.kv_cache_quant else model_config.dtype
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -74,15 +75,23 @@ class CacheEngine:
         for _ in range(self.num_layers):
             key_blocks = torch.empty(
                 size=(self.num_gpu_blocks, *key_block_shape),
-                dtype=self.dtype,
+                dtype=self.kv_dtype,
                 device="cuda",
             )
             value_blocks = torch.empty(
                 size=(self.num_gpu_blocks, *value_block_shape),
-                dtype=self.dtype,
+                dtype=self.kv_dtype,
                 device="cuda",
             )
-            gpu_cache.append((key_blocks, value_blocks))
+            if self.model_config.kv_cache_quant:
+                q_param_blocks = torch.empty(
+                    size=(self.num_gpu_blocks, self.num_heads, self.block_size, 4),
+                    dtype=self.dtype,
+                    device="cuda",
+                    )
+                gpu_cache.append((key_blocks, value_blocks, q_param_blocks))
+            else:
+                gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
 
     def allocate_cpu_cache(self) -> List[KVCache]:
@@ -98,15 +107,24 @@ class CacheEngine:
         for _ in range(self.num_layers):
             key_blocks = torch.empty(
                 size=(self.num_cpu_blocks, *key_block_shape),
-                dtype=self.dtype,
+                dtype=self.kv_dtype,
                 pin_memory=pin_memory,
             )
             value_blocks = torch.empty(
                 size=(self.num_cpu_blocks, *value_block_shape),
-                dtype=self.dtype,
+                dtype=self.kv_dtype,
                 pin_memory=pin_memory,
             )
-            cpu_cache.append((key_blocks, value_blocks))
+            if self.model_config.kv_cache_quant:
+                q_param_blocks = torch.empty(
+                    size=(self.num_cpu_blocks, self.num_heads, self.block_size, 4),
+                    dtype=self.dtype,
+                    pin_memory=pin_memory,
+                    )
+                cpu_cache.append((key_blocks, value_blocks, q_param_blocks))
+            else:
+                cpu_cache.append((key_blocks, value_blocks))
+
         return cpu_cache
 
     def _swap(
@@ -117,13 +135,22 @@ class CacheEngine:
     ) -> None:
         with torch.cuda.stream(self.cache_stream):
             for i in range(self.num_layers):
-                src_key_cache, src_value_cache = src[i]
-                dst_key_cache, dst_value_cache = dst[i]
+                if self.kv_cache_quant:
+                    src_key_cache, src_value_cache, src_q_param_cache = src[i]
+                    dst_key_cache, dst_value_cache, dst_q_param_cache = dst[i]
+                else:
+                    src_key_cache, src_value_cache = src[i]
+                    dst_key_cache, dst_value_cache = dst[i]
+ 
                 # Copy the key blocks.
                 cache_ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)
                 # Copy the value blocks.
                 cache_ops.swap_blocks(src_value_cache, dst_value_cache,
                                       src_to_dst)
+                if self.kv_cache_quant:
+                    cache_ops.swap_blocks(src_q_param_cache, dst_q_param_cache,
+                                          src_to_dst)
+
                 event = self.events[i]
                 event.record(stream=self.cache_stream)
 
@@ -134,10 +161,16 @@ class CacheEngine:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
-        value_caches = [value_cache for _, value_cache in self.gpu_cache]
-        # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
-        cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+        if self.kv_cache_quant:
+            key_caches = [key_cache for key_cache, _, _ in self.gpu_cache]
+            value_caches = [value_cache for _, value_cache, _ in self.gpu_cache]
+            q_param_caches = [q_param_cache for _, _, q_param in self.gpu_cache]
+            cache_ops.copy_blocks_quantized(key_caches, value_caches, q_param_caches, src_to_dsts)
+        else:
+            key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+            value_caches = [value_cache for _, value_cache in self.gpu_cache]
+            # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
+            cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
     @staticmethod
     def get_cache_block_size(
@@ -152,6 +185,14 @@ class CacheEngine:
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
+
+        debug_quant = False
+        if model_config.kv_cache_quant:
+            cache_block_size = _get_dtype_size(torch.int8) * total + \
+                        _get_dtype_size(model_config.dtype) * \
+                        (num_layers * block_size * num_heads * 4)
+            return cache_block_size
+
         dtype_size = _get_dtype_size(model_config.dtype)
         return dtype_size * total
 
