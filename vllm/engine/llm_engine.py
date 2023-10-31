@@ -144,6 +144,8 @@ class LLMEngine:
         self.num_context_tokens: List[Tuple[float, int]] = []
         self.all_flops = []
         self.all_bandwidth = []
+        self.avg_prompt_throughput = []
+        self.avg_throughput = []
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -727,9 +729,15 @@ class LLMEngine:
         if gpu_cache_usage > 0.60:
             self.all_flops.append(avg_tflops)
             self.all_bandwidth.append(avg_bandwidth)
+            self.avg_prompt_throughput.append(avg_prompt_throughput)
+            self.avg_throughput.append(avg_generation_throughput)
             mean_flops = sum(self.all_flops) / len(self.all_flops)
             mean_bandwidth = sum(self.all_bandwidth) / len(self.all_bandwidth)
-            logger.info(f"Avg tflops: {mean_flops:.1f} tflops/s, Bandwidth: {mean_bandwidth:.1f} GB/s")
+            mean_prompt_throughput = sum(self.avg_prompt_throughput) / len(self.avg_prompt_throughput)
+            mean_gen_throughput = sum(self.avg_throughput) / len(self.avg_throughput)
+            logger.info(f"Avg tflops: {mean_flops:.1f} tflops/s, Bandwidth: {mean_bandwidth:.1f} GB/s"
+                        f"Mean prompt throughput: {mean_prompt_throughput:.1f} tokens/s, "
+                        f"Mean throughput: {mean_gen_throughput:.1f} tokens/s")
 
         self.last_logging_time = now
 
