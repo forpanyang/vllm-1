@@ -26,6 +26,10 @@ void reshape_and_cache(
   torch::Tensor& value_cache,
   torch::Tensor& slot_mapping);
 
+void reshape_and_cache_fp8(torch::Tensor &key, torch::Tensor &value,
+                           torch::Tensor &key_cache, torch::Tensor &value_cache,
+                           torch::Tensor &slot_mapping);
+
 void reshape_and_cache_quantized(torch::Tensor &key, torch::Tensor &value,
                                  torch::Tensor &q_params,
                                  torch::Tensor &key_cache,
@@ -39,6 +43,10 @@ void gather_cached_kv(
   torch::Tensor& key_cache,
   torch::Tensor& value_cache,
   torch::Tensor& slot_mapping);
+
+void gather_cached_kv_fp8(torch::Tensor &key, torch::Tensor &value,
+                          torch::Tensor &key_cache, torch::Tensor &value_cache,
+                          torch::Tensor &slot_mapping);
 
 void gather_cached_kv_quantized(torch::Tensor &key, torch::Tensor &value,
                                 torch::Tensor &q_param,
@@ -64,11 +72,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "Reshape the key and value tensors and cache them");
   m.def("reshape_and_cache_quantized", &reshape_and_cache_quantized,
         "Reshape the quantized key and value tensors and cache them");
+  m.def("reshape_and_cache_fp8", &reshape_and_cache_fp8,
+        "Reshape the key and value tensors and cache them(fp8)");
   m.def(
     "gather_cached_kv",
     &gather_cached_kv,
     "Gather key and value from the cache into contiguous QKV tensors");
   m.def("gather_cached_kv_quantized", &gather_cached_kv_quantized,
+        "Gather key and value from the quantized cache into contiguous QKV "
+        "tensors");
+  m.def("gather_cached_kv_fp8", &gather_cached_kv_fp8,
         "Gather key and value from the quantized cache into contiguous QKV "
         "tensors");
 }

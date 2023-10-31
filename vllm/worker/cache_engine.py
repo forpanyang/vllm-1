@@ -36,6 +36,7 @@ class CacheEngine:
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
         self.dtype = model_config.dtype
         self.kv_dtype = torch.int8 if model_config.kv_cache_quant else model_config.dtype
+        self.kv_dtype = torch.uint8 if model_config.kv_fp8 else self.kv_dtype
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -192,8 +193,10 @@ class CacheEngine:
                         _get_dtype_size(model_config.dtype) * \
                         (num_layers * block_size * num_heads * 4)
             return cache_block_size
-
-        dtype_size = _get_dtype_size(model_config.dtype)
+        elif model_config.kv_fp8:
+            dtype_size = _get_dtype_size(torch.uint8)
+        else:
+            dtype_size = _get_dtype_size(model_config.dtype)
         return dtype_size * total
 
 

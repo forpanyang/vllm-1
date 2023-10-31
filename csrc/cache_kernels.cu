@@ -1,8 +1,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include "attention/quant_utils.cuh"
 #include "dispatch_utils.h"
-
 #include <algorithm>
 #include <cassert>
 #include <map>
@@ -222,6 +222,81 @@ void reshape_and_cache(
 }
 
 namespace vllm {
+template <typename scalar_t>
+__global__ void reshape_and_cache_fp8_kernel(
+    const scalar_t *__restrict__ key,   // [num_tokens, num_heads, head_size]
+    const scalar_t *__restrict__ value, // [num_tokens, num_heads, head_size]
+    uint8_t *__restrict__ key_cache,    // [num_blocks, num_heads, head_size/x,
+                                        // block_size, x]
+    uint8_t *__restrict__ value_cache,  // [num_blocks, num_heads, head_size,
+                                        // block_size]
+    const int *__restrict__ slot_mapping, // [num_tokens]
+    const int key_stride, const int value_stride, const int num_heads,
+    const int head_size, const int block_size, const int x) {
+  const int token_idx = blockIdx.x;
+  const int slot_idx = slot_mapping[token_idx];
+  const int block_idx = slot_idx / block_size;
+  const int block_offset = slot_idx % block_size;
+
+  const int n = num_heads * head_size;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int src_key_idx = token_idx * key_stride + i;
+    const int src_value_idx = token_idx * value_stride + i;
+
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const int x_idx = head_offset / x;
+    const int x_offset = head_offset % x;
+
+    const int tgt_key_idx =
+        block_idx * num_heads * (head_size / x) * block_size * x +
+        head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
+        block_offset * x + x_offset;
+    const int tgt_value_idx = block_idx * num_heads * head_size * block_size +
+                              head_idx * head_size * block_size +
+                              head_offset * block_size + block_offset;
+    key_cache[tgt_key_idx] = half_to_fp8e5m2(__ldg(&key[src_key_idx]));
+    value_cache[tgt_value_idx] = half_to_fp8e5m2(__ldg(&value[src_value_idx]));
+  }
+}
+
+} // namespace vllm
+
+void reshape_and_cache_fp8(
+    torch::Tensor &key,   // [num_tokens, num_heads, head_size]
+    torch::Tensor &value, // [num_tokens, num_heads, head_size]
+    torch::Tensor
+        &key_cache, // [num_blocks, num_heads, head_size/x, block_size, x]
+    torch::Tensor
+        &value_cache, // [num_blocks, num_heads, head_size, block_size]
+    torch::Tensor &slot_mapping) // [num_tokens]
+{
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(3);
+  int x = key_cache.size(4);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (key.dtype() == at::ScalarType::Half) {
+    typedef uint16_t scalar_t;
+    vllm::reshape_and_cache_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<scalar_t *>(key.data_ptr()),
+        reinterpret_cast<scalar_t *>(value.data_ptr()),
+        reinterpret_cast<uint8_t *>(key_cache.data_ptr()),
+        reinterpret_cast<uint8_t *>(value_cache.data_ptr()),
+        slot_mapping.data_ptr<int>(), key_stride, value_stride, num_heads,
+        head_size, block_size, x);
+  }
+}
+
+namespace vllm {
 
 // Grid: (num_blocks, block_size).
 template<typename scalar_t>
@@ -379,4 +454,84 @@ void gather_cached_kv(
         block_size,
         x);
     });
+}
+
+namespace vllm {
+
+// Grid: (num_blocks, block_size).
+template <typename scalar_t>
+__global__ void gather_cached_kv_fp8_kernel(
+    scalar_t *__restrict__ key, // [num_tokens, [stride], num_heads, head_size]
+    scalar_t
+        *__restrict__ value, // [num_tokens, [stride], num_heads, head_size]
+    const uint8_t *__restrict__ key_cache,   // [num_blocks, num_heads,
+                                             // head_size/x, block_size, x]
+    const uint8_t *__restrict__ value_cache, // [num_blocks, num_heads,
+                                             // head_size, block_size]
+    const int *__restrict__ slot_mapping,    // [num_tokens]
+    const int key_stride, const int value_stride, const int num_heads,
+    const int head_size, const int block_size, const int x) {
+  const int token_idx = blockIdx.x;
+  const int slot_idx = slot_mapping[token_idx];
+  const int block_idx = slot_idx / block_size;
+  const int block_offset = slot_idx % block_size;
+
+  const int num_tokens = num_heads * head_size;
+  for (int i = threadIdx.x; i < num_tokens; i += blockDim.x) {
+    const int tgt_key_idx = token_idx * key_stride + i;
+    const int tgt_value_idx = token_idx * value_stride + i;
+
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const int x_idx =
+        head_offset / x; // the offset of the [head_size/x] dimension
+    const int x_offset = head_offset % x;
+
+    const int src_key_idx =
+        block_idx * num_heads * (head_size / x) * block_size * x +
+        head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
+        block_offset * x + x_offset;
+    const int src_value_idx = block_idx * num_heads * head_size * block_size +
+                              head_idx * head_size * block_size +
+                              head_offset * block_size + block_offset;
+
+    key[tgt_key_idx] = fp8e5m2_to_half(__ldg(&key_cache[src_key_idx]));
+    value[tgt_value_idx] = fp8e5m2_to_half(__ldg(&value_cache[src_value_idx]));
+  }
+}
+
+} // namespace vllm
+
+void gather_cached_kv_fp8(
+    torch::Tensor &key,   // [out] [num_tokens, num_heads, head_size]
+    torch::Tensor &value, // [out] [num_tokens, num_heads, head_size]
+    torch::Tensor
+        &key_cache, // [in]  [num_blocks, num_heads, head_size/x, block_size, x]
+    torch::Tensor
+        &value_cache, // [in]  [num_blocks, num_heads, head_size, block_size]
+    torch::Tensor &slot_mapping) // [in]  [num_tokens]
+{
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(3);
+  int x = key_cache.size(4);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (key.dtype() == at::ScalarType::Half) {
+    typedef uint16_t scalar_t;
+    vllm::gather_cached_kv_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<scalar_t *>(key.data_ptr()),
+        reinterpret_cast<scalar_t *>(value.data_ptr()),
+        reinterpret_cast<uint8_t *>(key_cache.data_ptr()),
+        reinterpret_cast<uint8_t *>(value_cache.data_ptr()),
+        slot_mapping.data_ptr<int>(), key_stride, value_stride, num_heads,
+        head_size, block_size, x);
+  }
 }

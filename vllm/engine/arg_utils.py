@@ -32,6 +32,7 @@ class EngineArgs:
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
     kv_cache_quant: Optional[bool] = False
+    kv_fp8: Optional[bool] = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -185,7 +186,7 @@ class EngineArgs:
                                    self.download_dir, self.load_format,
                                    self.dtype, self.seed, self.revision,
                                    self.tokenizer_revision, self.max_model_len,
-                                   self.quantization, self.kv_cache_quant)
+                                   self.quantization, self.kv_cache_quant, self.kv_fp8)
         cache_config = CacheConfig(
             self.block_size, self.gpu_memory_utilization, self.swap_space,
             getattr(model_config.hf_config, 'sliding_window', None))

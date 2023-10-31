@@ -87,7 +87,7 @@ class PagedAttention(nn.Module):
                  scale: float,
                  num_kv_heads: Optional[int] = None,
                  sliding_window: Optional[int] = None,
-                 layer_idx: int = 0) -> None:
+                 layer_idx: int = 0, kv_fp8=False) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -96,6 +96,7 @@ class PagedAttention(nn.Module):
         self.sliding_window = sliding_window
         self.layer_idx = layer_idx
         self.step = 0
+        self.kv_fp8 = kv_fp8
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -196,6 +197,21 @@ class PagedAttention(nn.Module):
                 input_metadata.max_context_len,
                 None,  # alibi_slopes
             )
+        elif self.kv_fp8:
+            return attention_ops.single_query_cached_kv_attention_fp8(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                self.head_mapping,
+                self.scale,
+                input_metadata.block_tables,
+                input_metadata.context_lens,
+                block_size,
+                input_metadata.max_context_len,
+                None,  # alibi_slopes
+            )
+
         attention_ops.single_query_cached_kv_attention(
             output,
             query,
@@ -294,6 +310,14 @@ class PagedAttention(nn.Module):
                     q_param_cache,
                     slot_mapping,
                 )
+            elif self.kv_fp8:
+                cache_ops.reshape_and_cache_fp8(
+                    key_to_cache,
+                    value_to_cache,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )
             else:
                 cache_ops.reshape_and_cache(
                     key_to_cache,
@@ -335,14 +359,15 @@ class PagedAttentionWithRoPE(PagedAttention):
         is_neox_style: bool = True,
         rope_scaling: Optional[Dict[str, Any]] = None,
         sliding_window: Optional[int] = None,
-        layer_idx: int = 0
+        layer_idx: int = 0,
+        kv_fp8: bool = False
     ) -> None:
         super().__init__(num_heads,
                          head_size,
                          scale,
                          num_kv_heads,
                          sliding_window=sliding_window,
-                         layer_idx=layer_idx)
+                         layer_idx=layer_idx, kv_fp8=kv_fp8)
         if rope_scaling is None:
             self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
                                               max_position, base,

@@ -100,9 +100,9 @@ def get_model(model_config: ModelConfig, max_tokens: int) -> nn.Module:
         if model_config.quantization is not None and (
                 model_class in _MODEL_CLASSES_SUPPORT_QUANTIZATION[
                     model_config.quantization]):
-            model = model_class(model_config.hf_config, quant_config)
+            model = model_class(model_config.hf_config, quant_config, kv_fp8=model_config.kv_fp8)
         else:
-            model = model_class(model_config.hf_config)
+            model = model_class(model_config.hf_config, kv_fp8=model_config.kv_fp8)
         if model_config.load_format == "dummy":
             model = model.cuda()
             # NOTE(woosuk): For accurate performance evaluation, we assign

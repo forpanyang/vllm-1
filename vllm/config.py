@@ -66,6 +66,7 @@ class ModelConfig:
         max_model_len: Optional[int] = None,
         quantization: Optional[str] = None,
         kv_cache_quant: Optional[bool] = False,
+        kv_fp8: Optional[bool] = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -83,6 +84,7 @@ class ModelConfig:
         self.max_model_len = _get_and_verify_max_len(self.hf_config,
                                                      max_model_len)
         self.kv_cache_quant = kv_cache_quant
+        self.kv_fp8 = kv_fp8
         self._verify_load_format()
         self._verify_tokenizer_mode()
         self._verify_quantization()

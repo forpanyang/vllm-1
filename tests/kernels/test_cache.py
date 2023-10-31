@@ -383,3 +383,62 @@ def test_gather_cached_kv_quantized(
     assert torch.allclose(key, cloned_key)
     assert torch.allclose(value, cloned_value)
     assert torch.allclose(q_param, cloned_param)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("dtype", [torch.half])
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_gather_cached_kv_fp8(
+    kv_cache_factory,
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> None:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # Create a random slot mapping.
+    num_slots = block_size * num_blocks
+    slot_mapping = random.sample(range(num_slots), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int, device="cuda")
+
+    qkv = torch.randn(num_tokens,
+                      3,
+                      num_heads,
+                      head_size,
+                      dtype=dtype,
+                      device="cuda")
+    _, key, value = qkv.unbind(dim=1)
+    # Create the KV caches.
+    key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
+                                                num_heads, head_size, dtype,
+                                                seed)
+    key_cache, value_cache = key_caches[0], value_caches[0]
+
+    # Clone the KV caches.
+    cloned_key = key.clone()
+    cloned_value = value.clone()
+
+    # Call the reshape_and_cache kernel.
+    cache_ops.reshape_and_cache_fp8(
+            key, value, key_cache, value_cache,
+            slot_mapping)
+    key.zero_()
+    value.zero_()
+    # Call the reshape_and_cache kernel.
+    cache_ops.gather_cached_kv_fp8(
+            key, value, key_cache, value_cache,
+            slot_mapping)
+
+    assert torch.allclose(key, cloned_key, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(value, cloned_value, atol=1e-2, rtol=1e-2)

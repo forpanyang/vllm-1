@@ -32,8 +32,11 @@ _LOGGING_INTERVAL_SEC = 5
 def kv_cache_size(num_tokens, hf_config):
     return 2 * num_tokens * hf_config.num_key_value_heads * hf_config.hidden_size / hf_config.num_attention_heads
 
-def bandwidth_per_step(batch_size, seqlen, num_tokens, hf_config):
+def bandwidth_per_step(batch_size, seqlen, num_tokens, model_config):
+    hf_config = model_config.hf_config
     approx_kv_cache_size = kv_cache_size(num_tokens, hf_config) / (1e9)
+    if not model_config.kv_cache_quant and not model_config.kv_fp8:
+        approx_kv_cache_size *= 2
     # Estimated or profiled? Estimated currently
     # [b, s, h]x3 // Q, K, V
     # [b, s, h]x2 // Qemb, Kemb
@@ -42,7 +45,7 @@ def bandwidth_per_step(batch_size, seqlen, num_tokens, hf_config):
     # [b, s, h_in]x4 // Up MLP, Gate MLP, Gelu, Up * Gelu
     # [b, s, h] // Down MLP
     approx_activation_size = batch_size * seqlen * hf_config.num_hidden_layers * (8 * hf_config.hidden_size + 4 * hf_config.intermediate_size) / (1e9)
-    return approx_activation_size * 2 + approx_kv_cache_size * 2
+    return approx_activation_size * 2 + approx_kv_cache_size
 
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
@@ -97,6 +100,7 @@ class LLMEngine:
             f"load_format={model_config.load_format}, "
             f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
             f"quantization={model_config.quantization}, "
+            f"kv_cache_quant={model_config.kv_cache_quant}, "
             f"seed={model_config.seed})")
         # TODO(woosuk): Print more configs in debug mode.
 
@@ -579,7 +583,7 @@ class LLMEngine:
                 batch = scheduler_outputs.num_batched_tokens
 
             flops = flops_per_step(batch, seq_len, hf_config)
-            bandwidth = self.parameters_in_billions[0] + bandwidth_per_step(batch, seq_len, num_context_tokens, hf_config) / self.parallel_config.world_size
+            bandwidth = self.parameters_in_billions[0] + bandwidth_per_step(batch, seq_len, num_context_tokens, self.model_config) / self.parallel_config.world_size
             self._log_system_stats(scheduler_outputs.prompt_run,
                                    scheduler_outputs.num_batched_tokens, flops, bandwidth)
 

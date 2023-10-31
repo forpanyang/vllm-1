@@ -9,6 +9,162 @@
 #include "dtype_float32.cuh"
 using namespace vllm;
 
+/*
+struct PseudoHalf {
+    uint16_t bits;
+};
+
+struct PseudoFP8 {
+    uint8_t bits;
+};*/
+
+typedef uint8_t PseudoFP8;
+typedef uint16_t PseudoHalf;
+
+inline __device__ PseudoFP8 half_to_fp8e4m3(PseudoHalf fp16) {
+    PseudoFP8 fp8;
+    // IEEE(half): 1,e5,m10
+    uint8_t sign = (fp16 >> 15) & 0x1;
+    uint8_t exponent = ((fp16 >> 10) & 0x1F) - 31;  // 指数减去偏移值
+    uint8_t fraction = (fp16 >> 7) & 0x07; // 保留 3 位尾数
+    // 使用条件表达式处理上溢和下溢的情况
+    exponent = (exponent > 7) ? 15 : ((exponent < -8) ? 0 : exponent + 7);
+    fraction = (exponent > 7 || exponent < -8) ? 0 : fraction;
+
+    fp8 = (sign << 7) | (exponent << 3) | fraction;
+    return fp8;
+}
+
+inline __device__ PseudoHalf fp8e4m3_to_half(PseudoFP8 fp8) {
+    PseudoHalf fp16;
+    uint8_t sign = (fp8 >> 7) & 0x1;
+    uint8_t exponent = ((fp8 >> 3) & 0x0F) - 15 + 31;  // 指数矫正偏移值
+    uint8_t fraction = fp8 & 0x07; // 保留 3 位尾数
+
+    // IEEE(half): 1,e5,m10
+    fp16 = (sign << 15) | (exponent << 10) | (fraction << 7);
+    return fp16;
+}
+
+inline __device__ PseudoFP8 half_to_fp8e3m5(PseudoHalf fp16) {
+    PseudoFP8 fp8;
+    // IEEE(half): 1,e5,m10
+    uint8_t sign = (fp16 >> 15) & 0x1;
+    uint8_t exponent = ((fp16 >> 10) & 0x1F) - 31;  // 指数减去偏移值
+    uint8_t fraction = (fp16 >> 5) & 0x1F; // 保留 5 位尾数
+    // 使用条件表达式处理上溢和下溢的情况
+    exponent = (exponent > 3) ? 7 : ((exponent < -4) ? 0 : exponent + 3);
+    fraction = (exponent > 3 || exponent < -4) ? 0 : fraction;
+
+    fp8 = (sign << 7) | (exponent << 5) | fraction;
+    return fp8;
+}
+
+
+inline __device__ PseudoFP8 half_to_fp8e5m2(PseudoHalf fp16) {
+    PseudoFP8 fp8;
+    // IEEE(half): 1,e5,m10
+    fp8 = (fp16 >> 8) & 0xFF;
+    return fp8;
+}
+
+
+template<typename Tout, typename Tin>
+inline __device__ Tout fp8e5m2_to_half(Tin x)
+{
+    return x;
+}
+
+inline __device__ uint16_t __fp8e5m2_to_half(uint8_t fp8) {
+    PseudoHalf fp16;
+    // IEEE(half): 1,e5,m10
+    fp16 = fp8 << 8;
+    return fp16;
+}
+
+template<>
+inline __device__ uint16_t fp8e5m2_to_half<uint16_t, uint8_t>(uint8_t fp8) {
+    PseudoHalf fp16;
+    // IEEE(half): 1,e5,m10
+    fp16 = fp8 << 8;
+    return fp16;
+}
+
+template<>
+inline __device__ uint32_t fp8e5m2_to_half<uint32_t, uint16_t>(uint16_t d) {
+    union {
+        uint16_t fp16x2[2];
+        uint32_t uint32;
+    };
+    union {
+        uint8_t fp8x2[2];
+        uint16_t uint16;
+    };
+    uint16 = d;
+    fp16x2[0] = __fp8e5m2_to_half(fp8x2[0]);
+    fp16x2[1] = __fp8e5m2_to_half(fp8x2[1]);
+    return uint32;
+}
+
+template<>
+inline __device__  uint2 fp8e5m2_to_half<uint2, uint32_t>(uint32_t d) {
+    union {
+        uint16_t fp16x4[4];
+        uint2 uint64;
+    };
+    union {
+        uint8_t fp8x4[4];
+        uint32_t uint32;
+    };
+    uint32 = d;
+    fp16x4[0] = __fp8e5m2_to_half(fp8x4[0]);
+    fp16x4[1] = __fp8e5m2_to_half(fp8x4[1]);
+    fp16x4[2] = __fp8e5m2_to_half(fp8x4[2]);
+    fp16x4[3] = __fp8e5m2_to_half(fp8x4[3]);
+    return uint64;
+}
+
+template<>
+inline __device__ uint64_t fp8e5m2_to_half<uint64_t, uint32_t>(uint32_t d) {
+    union {
+        uint16_t fp16x4[4];
+        uint64_t uint64;
+    };
+    union {
+        uint8_t fp8x4[4];
+        uint32_t uint32;
+    };
+    uint32 = d;
+    fp16x4[0] = __fp8e5m2_to_half(fp8x4[0]);
+    fp16x4[1] = __fp8e5m2_to_half(fp8x4[1]);
+    fp16x4[2] = __fp8e5m2_to_half(fp8x4[2]);
+    fp16x4[3] = __fp8e5m2_to_half(fp8x4[3]);
+    return uint64;
+}
+
+template<>
+inline __device__ uint4 fp8e5m2_to_half<uint4, uint64_t>(uint64_t d) {
+    union {
+        uint16_t fp16x8[8];
+        uint4 uint64x2;
+    };
+    union {
+        uint8_t fp8x8[8];
+        uint64_t uint64;
+    };
+    uint64 = d;
+    fp16x8[0] = __fp8e5m2_to_half(fp8x8[0]);
+    fp16x8[1] = __fp8e5m2_to_half(fp8x8[1]);
+    fp16x8[2] = __fp8e5m2_to_half(fp8x8[2]);
+    fp16x8[3] = __fp8e5m2_to_half(fp8x8[3]);
+    fp16x8[4] = __fp8e5m2_to_half(fp8x8[4]);
+    fp16x8[5] = __fp8e5m2_to_half(fp8x8[5]);
+    fp16x8[6] = __fp8e5m2_to_half(fp8x8[6]);
+    fp16x8[7] = __fp8e5m2_to_half(fp8x8[7]);
+ 
+    return uint64x2;
+}
+
 template <int VEC_SIZE>
 union QuantParamVec {};
 

@@ -94,6 +94,7 @@ class LlamaAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         layer_idx: int = 0,
+        kv_fp8: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -144,7 +145,7 @@ class LlamaAttention(nn.Module):
             rotary_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,
             rope_scaling=rope_scaling,
-            layer_idx=layer_idx)
+            layer_idx=layer_idx, kv_fp8=kv_fp8)
 
     def forward(
         self,
@@ -174,7 +175,8 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        layer_idx: int = 0
+        layer_idx: int = 0,
+        kv_fp8: bool = False
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -191,7 +193,8 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            kv_fp8=kv_fp8
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -238,6 +241,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        kv_fp8: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -250,7 +254,7 @@ class LlamaModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config, k)
+            LlamaDecoderLayer(config, quant_config, k, kv_fp8)
             for k in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -287,11 +291,12 @@ class LlamaForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        kv_fp8: bool = False
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config)
+        self.model = LlamaModel(config, quant_config, kv_fp8)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         # NOTE: The LM head is not quantized.
         self.lm_head = ParallelLinear.column(config.hidden_size,
