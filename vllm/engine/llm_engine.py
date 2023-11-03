@@ -146,6 +146,7 @@ class LLMEngine:
         self.all_bandwidth = []
         self.avg_prompt_throughput = []
         self.avg_throughput = []
+        self.avg_batch = []
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -731,13 +732,16 @@ class LLMEngine:
             self.all_bandwidth.append(avg_bandwidth)
             self.avg_prompt_throughput.append(avg_prompt_throughput)
             self.avg_throughput.append(avg_generation_throughput)
+            self.avg_batch.append(avg_generation_batch)
             mean_flops = sum(self.all_flops) / len(self.all_flops)
             mean_bandwidth = sum(self.all_bandwidth) / len(self.all_bandwidth)
             mean_prompt_throughput = sum(self.avg_prompt_throughput) / len(self.avg_prompt_throughput)
             mean_gen_throughput = sum(self.avg_throughput) / len(self.avg_throughput)
-            logger.info(f"Avg tflops: {mean_flops:.1f} tflops/s, Bandwidth: {mean_bandwidth:.1f} GB/s"
+            mean_batch = sum(self.avg_batch) / len(self.avg_batch)
+            logger.info(f"Avg tflops: {mean_flops:.1f} tflops/s, Bandwidth: {mean_bandwidth:.1f} GB/s, "
                         f"Mean prompt throughput: {mean_prompt_throughput:.1f} tokens/s, "
-                        f"Mean throughput: {mean_gen_throughput:.1f} tokens/s")
+                        f"Mean throughput: {mean_gen_throughput:.1f} tokens/s, "
+                        f"Mean batch: {mean_batch:.1f}")
 
         self.last_logging_time = now
 
