@@ -201,6 +201,40 @@ quantization_extension = CUDAExtension(
 )
 ext_modules.append(quantization_extension)
 
+# Quantization cutlass kernels.
+cutlass_quantization_extension = CUDAExtension(
+    name="vllm.cutlass_quantization_ops",
+    sources=[
+        "csrc/cutlass_quantization.cpp",
+        "csrc/quantization/awq_cutlass/gemm_cuda.cpp",
+        "csrc/quantization/awq_cutlass/gemm_profiler.cpp",
+        "csrc/quantization/awq_cutlass/fp16_int4_gemm_fg_scalebias.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int4b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int4b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int4b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int4b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int8b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int8b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int8b.cu",
+        "csrc/quantization/awq_cutlass/weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int8b.cu",
+        "3rdparty/tensorrt_llm/common/logger.cpp",
+        "3rdparty/tensorrt_llm/common/stringUtils.cpp",
+        "3rdparty/tensorrt_llm/common/tllmException.cpp",
+        "3rdparty/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        "3rdparty/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.cu",
+    ],
+    include_dirs=[
+        os.path.join(ROOT_DIR, "3rdparty/cutlass/include"),
+        os.path.join(ROOT_DIR, "3rdparty/tensorrt_llm"),
+        os.path.join(ROOT_DIR, "3rdparty/"),
+    ],
+    extra_compile_args={
+        "cxx": CXX_FLAGS,
+        "nvcc": NVCC_FLAGS,
+    },
+)
+ext_modules.append(cutlass_quantization_extension)
+
 # Misc. CUDA utils.
 cuda_utils_extension = CUDAExtension(
     name="vllm.cuda_utils",
