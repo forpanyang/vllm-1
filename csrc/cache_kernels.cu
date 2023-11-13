@@ -495,8 +495,10 @@ __global__ void gather_cached_kv_fp8_kernel(
                               head_idx * head_size * block_size +
                               head_offset * block_size + block_offset;
 
-    key[tgt_key_idx] = fp8e5m2_to_half(__ldg(&key_cache[src_key_idx]));
-    value[tgt_value_idx] = fp8e5m2_to_half(__ldg(&value_cache[src_value_idx]));
+    key[tgt_key_idx] =
+        fp8e5m2_to_half<uint16_t, uint8_t>(__ldg(&key_cache[src_key_idx]));
+    value[tgt_value_idx] =
+        fp8e5m2_to_half<uint16_t, uint8_t>(__ldg(&value_cache[src_value_idx]));
   }
 }
 
