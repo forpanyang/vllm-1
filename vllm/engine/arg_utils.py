@@ -161,6 +161,13 @@ class EngineArgs:
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='disable logging statistics')
+        parser.add_argument('--kv-cache-quant',
+                            action='store_true',
+                            help='disable logging statistics')
+        parser.add_argument('--kv-fp8',
+                            action='store_true',
+                            help='disable logging statistics')
+ 
         # Quantization settings.
         parser.add_argument('--quantization',
                             '-q',
